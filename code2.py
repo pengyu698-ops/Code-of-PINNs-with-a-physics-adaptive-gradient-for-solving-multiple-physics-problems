@@ -1,0 +1,201 @@
+#Physical Adaptive Gradient Clipping Sin-Tanh Hybrid PINN Architecture for Solving Flow Around a Cylinder Code
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+import os
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.set_default_dtype(torch.float32)
+U_inf = 1.0                        
+nu = 0.025                        
+R = 0.5                      
+x_c, y_c = 0.0, 0.0                
+x_domain = [-5.0, 10.0]        
+y_domain = [-5.0, 5.0]             
+N_phy = 12000                     
+N_bc = 4000                       
+N_cyl = 3000                     
+Loss_Weight = {'phy': 1.0, 'bc': 2.0, 'cyl': 10.0} 
+Learning_Rate = 1e-3   
+torch.manual_seed(3)
+Epoch = 30000         
+def normalize(data, domain):
+    return 2.0 * (data - domain[0]) / (domain[1] - domain[0]) - 1.0
+def denormalize(data, domain):
+    return 0.5 * (data + 1.0) * (domain[1] - domain[0]) + domain[0]
+class SinActivation(nn.Module):
+    def __init__(self, omega):
+        super().__init__()
+        self.omega = omega
+    def forward(self, x):
+        return torch.sin(self.omega * x)
+class SoftConstraintPINN(nn.Module):
+    def __init__(self, omega=30.0, out_dim=2, domain1=x_domain, domain2=y_domain): 
+        super(SoftConstraintPINN, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, 128), SinActivation(omega),
+            nn.Linear(128, 256), SinActivation(omega),
+            nn.Linear(256, 256), SinActivation(omega),
+            nn.Linear(256, 128), nn.Tanh(),
+            nn.Linear(128, out_dim)
+        )
+        linear_idx = 0
+        with torch.no_grad():
+            for m in self.net.modules():
+                if isinstance(m, nn.Linear):
+                    if linear_idx == 0:  
+                        freq_1 = (domain1[1] - domain1[0]) / omega
+                        freq_2 = (domain2[1] - domain2[0]) / omega                      
+                        m.weight[:, 0].uniform_(-freq_1, freq_1) 
+                        m.weight[:, 1].uniform_(-freq_2, freq_2) 
+                    else:             
+                        m.weight.uniform_(-np.sqrt(6 / m.in_features) / omega, 
+                                           np.sqrt(6 / m.in_features) / omega)
+                    linear_idx += 1
+    def forward(self, x1, x2):
+        net_input = torch.cat([x1, x2], dim=1)
+        net_output = self.net(net_input)
+        return net_output
+def generate_training_data():
+    x_phy_raw = torch.rand(N_phy * 2, 1, device=device) * (x_domain[1] - x_domain[0]) + x_domain[0]
+    y_phy_raw = torch.rand(N_phy * 2, 1, device=device) * (y_domain[1] - y_domain[0]) + y_domain[0]
+    mask = (x_phy_raw - x_c)**2 + (y_phy_raw - y_c)**2 > R**2
+    x_phy = x_phy_raw[mask][:N_phy].view(-1, 1)
+    y_phy = y_phy_raw[mask][:N_phy].view(-1, 1)
+    N_each_bc = N_bc // 4
+    x_in = torch.full((N_each_bc, 1), x_domain[0], device=device)
+    y_in = torch.rand(N_each_bc, 1, device=device) * (y_domain[1] - y_domain[0]) + y_domain[0]
+    x_out = torch.full((N_each_bc, 1), x_domain[1], device=device)
+    y_out = torch.rand(N_each_bc, 1, device=device) * (y_domain[1] - y_domain[0]) + y_domain[0] 
+    x_top = torch.rand(N_each_bc, 1, device=device) * (x_domain[1] - x_domain[0]) + x_domain[0]
+    y_top = torch.full((N_each_bc, 1), y_domain[1], device=device)
+    x_bot = torch.rand(N_each_bc, 1, device=device) * (x_domain[1] - x_domain[0]) + x_domain[0]
+    y_bot = torch.full((N_each_bc, 1), y_domain[0], device=device)
+    x_wall = torch.cat([x_top, x_bot], dim=0)
+    y_wall = torch.cat([y_top, y_bot], dim=0)
+    theta = torch.rand(N_cyl, 1, device=device) * 2 * np.pi
+    x_cyl = x_c + R * torch.cos(theta)
+    y_cyl = y_c + R * torch.sin(theta)
+    data = {
+        'phy': (normalize(x_phy, x_domain), normalize(y_phy, y_domain)),
+        'in': (normalize(x_in, x_domain), normalize(y_in, y_domain)),
+        'out': (normalize(x_out, x_domain), normalize(y_out, y_domain)),
+        'wall': (normalize(x_wall, x_domain), normalize(y_wall, y_domain)),
+        'cyl': (normalize(x_cyl, x_domain), normalize(y_cyl, y_domain))
+    }
+    return data
+def Loss(pinn_model, data):
+    x_phy_norm, y_phy_norm = data['phy']
+    x_in_norm, y_in_norm = data['in']
+    x_out_norm, y_out_norm = data['out']
+    x_wall_norm, y_wall_norm = data['wall']
+    x_cyl_norm, y_cyl_norm = data['cyl'] 
+    d1_norm_d1 = 2.0 / (x_domain[1] - x_domain[0])
+    d2_norm_d2 = 2.0 / (y_domain[1] - y_domain[0])
+    def get_uv_p(x_n, y_n):
+        x_n.requires_grad_(True)
+        y_n.requires_grad_(True)
+        net_output = pinn_model(x_n, y_n)
+        psi = net_output[:, [0]]
+        p = net_output[:, [1]]
+        u =  torch.autograd.grad(psi.sum(), y_n, create_graph=True)[0] * d2_norm_d2
+        v = -torch.autograd.grad(psi.sum(), x_n, create_graph=True)[0] * d1_norm_d1
+        return u, v, p, x_n, y_n
+    u_phy, v_phy, p_phy, x_n, y_n = get_uv_p(x_phy_norm, y_phy_norm)
+    u_x = torch.autograd.grad(u_phy.sum(), x_n, create_graph=True)[0] * d1_norm_d1
+    u_y = torch.autograd.grad(u_phy.sum(), y_n, create_graph=True)[0] * d2_norm_d2
+    v_x = torch.autograd.grad(v_phy.sum(), x_n, create_graph=True)[0] * d1_norm_d1
+    v_y = torch.autograd.grad(v_phy.sum(), y_n, create_graph=True)[0] * d2_norm_d2
+    u_xx = torch.autograd.grad(u_x.sum(), x_n, create_graph=True)[0] * d1_norm_d1
+    u_yy = torch.autograd.grad(u_y.sum(), y_n, create_graph=True)[0] * d2_norm_d2
+    v_xx = torch.autograd.grad(v_x.sum(), x_n, create_graph=True)[0] * d1_norm_d1
+    v_yy = torch.autograd.grad(v_y.sum(), y_n, create_graph=True)[0] * d2_norm_d2
+    p_x = torch.autograd.grad(p_phy.sum(), x_n, create_graph=True)[0] * d1_norm_d1
+    p_y = torch.autograd.grad(p_phy.sum(), y_n, create_graph=True)[0] * d2_norm_d2
+    f_u = u_phy * u_x + v_phy * u_y + p_x - nu * (u_xx + u_yy)
+    f_v = u_phy * v_x + v_phy * v_y + p_y - nu * (v_xx + v_yy)
+    loss_phy = torch.mean(f_u**2) + torch.mean(f_v**2)
+    u_in, v_in, _, _, _ = get_uv_p(x_in_norm, y_in_norm)
+    loss_in = torch.mean((u_in - U_inf)**2) + torch.mean(v_in**2)
+    _, _, p_out, _, _ = get_uv_p(x_out_norm, y_out_norm)
+    loss_out = torch.mean(p_out**2)
+    u_wall, v_wall, _, _, _ = get_uv_p(x_wall_norm, y_wall_norm)
+    loss_wall = torch.mean((u_wall - U_inf)**2) + torch.mean(v_wall**2)
+    loss_bc = loss_in + loss_out + loss_wall
+    u_cyl, v_cyl, _, _, _ = get_uv_p(x_cyl_norm, y_cyl_norm)
+    loss_cyl = torch.mean(u_cyl**2) + torch.mean(v_cyl**2)
+    loss_total = (Loss_Weight['phy'] * loss_phy +
+                  Loss_Weight['bc'] * loss_bc +
+                  Loss_Weight['cyl'] * loss_cyl)        
+    return loss_total, loss_phy, loss_bc, loss_cyl
+pinn_model = SoftConstraintPINN(omega=30.0, out_dim=2, domain1=x_domain, domain2=y_domain).to(device)
+optimizer = torch.optim.Adam(pinn_model.parameters(), lr=Learning_Rate)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=500, min_lr=1e-6)
+LOAD_MODEL = False
+MODEL_PATH = "PINN_Cylinder_steady.pth"
+ALPHA = 0.75
+loss_total_history, loss_phy_history, loss_bc_history, loss_cyl_history, LR, C_history = [], [], [], [], [], []
+if LOAD_MODEL and os.path.exists(MODEL_PATH):
+    pinn_model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+else:
+    for epoch in range(Epoch + 1):
+        data = generate_training_data()
+        optimizer.zero_grad()  
+        loss_total, loss_phy, loss_bc, loss_cyl = Loss(pinn_model, data)
+        loss_total.backward()  
+        current_lr = optimizer.param_groups[0]['lr']
+        total_norm = torch.norm(
+            torch.stack([torch.norm(p.grad.detach(), 2) 
+                         for p in pinn_model.parameters() if p.grad is not None]), 
+            2
+        )
+        dynamic_C = (ALPHA / (current_lr + 1e-8)) * (torch.sqrt(loss_total.detach()) / (total_norm + 1e-8))
+        torch.nn.utils.clip_grad_norm_(pinn_model.parameters(), max_norm=dynamic_C) 
+        optimizer.step()
+        scheduler.step(loss_total)
+        loss_total_history.append(loss_total.item())
+        loss_phy_history.append(loss_phy.item())
+        loss_bc_history.append(loss_bc.item())
+        loss_cyl_history.append(loss_cyl.item())
+        LR.append(current_lr)
+        C_history.append(dynamic_C.item() if isinstance(dynamic_C, torch.Tensor) else dynamic_C)  
+        if epoch % 500 == 0:
+            print(f"Epoch[{epoch}/{Epoch}], LR: {current_lr:.2e}, "
+                  f"Total: {loss_total.item():.4e}, Phy: {loss_phy.item():.4e}, "
+                  f"BC: {loss_bc.item():.4e}, Cyl: {loss_cyl.item():.4e},"
+                  f"Clip_C: {dynamic_C:.4f}")        
+    torch.save(pinn_model.state_dict(), MODEL_PATH)
+pinn_model.eval()
+pts_1 = np.linspace(x_domain[0], x_domain[1], 150)
+pts_2 = np.linspace(y_domain[0], y_domain[1], 100)
+Grid_1, Grid_2 = np.meshgrid(pts_1, pts_2)
+x_torch = torch.tensor(Grid_1, dtype=torch.float32).view(-1, 1).requires_grad_(True).to(device)
+y_torch = torch.tensor(Grid_2, dtype=torch.float32).view(-1, 1).requires_grad_(True).to(device)
+x_norm = normalize(x_torch, x_domain)
+y_norm = normalize(y_torch, y_domain)
+d1_norm_d1 = 2.0 / (x_domain[1] - x_domain[0])
+d2_norm_d2 = 2.0 / (y_domain[1] - y_domain[0])
+net_output_pred = pinn_model(x_norm, y_norm)
+psi_pred = net_output_pred[:, [0]]
+p_pred = net_output_pred[:, [1]]
+u_pred =  torch.autograd.grad(psi_pred.sum(), y_norm, create_graph=False, retain_graph=True)[0] * d2_norm_d2
+v_pred = -torch.autograd.grad(psi_pred.sum(), x_norm, create_graph=False)[0] * d1_norm_d1
+U = u_pred.detach().reshape(Grid_1.shape).cpu().numpy()
+V = v_pred.detach().reshape(Grid_1.shape).cpu().numpy()
+P = p_pred.detach().reshape(Grid_1.shape).cpu().numpy()
+mask = (Grid_1 - x_c)**2 + (Grid_2 - y_c)**2 <= R**2
+U[mask] = np.nan
+V[mask] = np.nan
+P[mask] = np.nan
+df_loss = pd.DataFrame({
+    'Total Loss': loss_total_history,
+    'Physics Loss': loss_phy_history,
+    'BC Loss': loss_bc_history,
+    'Cyl Loss': loss_cyl_history,
+    'Learning Rate' : LR,
+    'Dynamic Clip C': C_history
+})
+df_loss.to_excel("LOSS_Cylinder.xlsx", index=False)
+pd.DataFrame(U).to_excel('Velocity_U.xlsx', index=False, header=False)
+pd.DataFrame(V).to_excel('Velocity_V.xlsx', index=False, header=False)
+pd.DataFrame(P).to_excel('Pressure_P.xlsx', index=False, header=False)
